@@ -1,0 +1,197 @@
+version: "3.9"
+
+# ================================================================
+#  AMR Robot — NIA Semi-Humanoid Platform
+#  jetson-containers edition | L4T 36.4.7 | JetPack 6.2.1
+#
+#  STARTUP ORDER (do in this exact sequence):
+#    1. Install jetson-containers:
+#         git clone https://github.com/dusty-nv/jetson-containers
+#         bash jetson-containers/install.sh
+#
+#    2. Create .env file (see bottom of this file)
+#
+#    3. Start everything:
+#         docker compose up
+#
+#    4. OR development mode (live code mount):
+#         docker compose up redis neo4j local_llm
+#         jetson-containers run \
+#           -v $(pwd):/workspace \
+#           $(autotag ultralytics)
+#         # inside container:
+#         pip install -r requirements.txt
+#         pip install git+https://github.com/openai/CLIP.git
+#         python3 main.py
+#
+#  NOTE: "[Warn] Unknown L4T_VERSION: 36.4.7" from autotag is cosmetic.
+#  Safe to ignore — still resolves correct r36.4 image.
+#
+#  ROS2: set same domain ID on Jetson AND Raspberry Pi:
+#    export ROS_DOMAIN_ID=42
+# ================================================================
+
+networks:
+  robot_net:
+    driver: bridge
+
+volumes:
+  redis_data:     # object/spatial/experience memory — survives restarts
+  neo4j_data:     # scene graph relationships — survives restarts
+  model_cache:    # YOLO / CLIP / sentence-transformer model files
+  faiss_data:     # FAISS vector index — survives restarts
+  llm_cache:      # Gemma 3 1B weights — survives restarts (avoid re-download)
+
+services:
+
+  # ── Redis 7 — fast persistent key-value memory ─────────────────
+  redis:
+    image: redis/redis-stack:7.4.0-v1
+    container_name: redis
+    networks: [robot_net]
+    ports:
+      - "6379:6379"
+      - "8001:8001"   # Redis Insight UI — http://jetson-ip:8001
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Neo4j 5 — scene graph (object spatial relations) ───────────
+  neo4j:
+    image: neo4j:5
+    container_name: neo4j
+    networks: [robot_net]
+    ports:
+      - "7474:7474"   # Neo4j browser — http://jetson-ip:7474
+      - "7687:7687"   # Bolt protocol — scene_graph.py connects here
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-changeme}
+    volumes:
+      - neo4j_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── Local LLM — Gemma 3 1B on Jetson ───────────────────────────
+  # NEW: replaces cloud GPT-4o-mini with on-device inference
+  # Free, fully offline, ~100 tokens/sec on Orin Nano 8GB
+  # Serves OpenAI-compatible API on port 9000
+  # llm_client.py auto-detects and uses this first (LLM_MODE=auto)
+  # Falls back to cloud GPT-4o-mini if this is unavailable
+  local_llm:
+    image: dustynv/local_llm:r36.4.0
+    container_name: local_llm
+    runtime: nvidia
+    networks: [robot_net]
+    ports:
+      - "9000:9000"   # OpenAI-compatible endpoint for llm_client.py
+    environment:
+      MODEL: google/gemma-3-1b-it
+      QUANT: q4
+      MAX_CONTEXT_LEN: "4096"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - llm_cache:/data/models    # cache model weights — avoids re-download on restart
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/v1/models || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s           # Gemma takes ~60-90s to load on first start
+
+  # ── Robot Brain — perception + world model + planner ───────────
+  robot_brain:
+    build:
+      context: .
+      dockerfile: Dockerfile.robot
+    container_name: robot_brain
+    runtime: nvidia               # REQUIRED — gives container GPU access
+    networks: [robot_net]
+    env_file: .env
+    environment:
+      # Memory
+      REDIS_URL: redis://redis:6379
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      FAISS_INDEX_PATH: /workspace/data/object_index.faiss
+      # LLM — tries local Gemma first, falls back to cloud GPT-4o-mini
+      LLM_MODE: auto
+      LOCAL_LLM_URL: http://local_llm:9000/v1
+      LOCAL_LLM_MODEL: google/gemma-3-1b-it
+      # Robot
+      SHOW_DISPLAY: "0"           # set to "1" only when monitor connected
+      EXECUTOR_MOCK: "0"          # set to "1" to test without physical arm
+      ROS_DOMAIN_ID: "42"         # MUST match Raspberry Pi — check both sides
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    devices:
+      - /dev/video0:/dev/video0   # RealSense D435 — check: ls /dev/video*
+      - /dev/bus/usb:/dev/bus/usb # USB devices
+    volumes:
+      - model_cache:/root/.cache  # share pre-downloaded AI models
+      - faiss_data:/workspace/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_started
+      local_llm:
+        condition: service_started
+    restart: unless-stopped
+
+# ================================================================
+#  .env FILE — create on Jetson before running (NEVER commit to git)
+#
+#  cat > .env << EOF
+#  OPENAI_API_KEY=sk-...              ← cloud fallback only
+#  NEO4J_PASSWORD=your_strong_password
+#  LLM_MODE=auto
+#  SHOW_DISPLAY=0
+#  EXECUTOR_MOCK=0
+#  ROS_DOMAIN_ID=42
+#  EOF
+#
+# ================================================================
+#  6-STAGE INTEGRATION TESTING — run in order, never skip
+#
+#  Stage 1 — Camera alone
+#    SHOW_DISPLAY=1 python3 -c "
+#    from Perception.camera_realsense import RealSenseCamera
+#    RealSenseCamera().show_stream()"
+#
+#  Stage 2 — Perception alone (check 3D positions with ruler)
+#    EXECUTOR_MOCK=1 python3 -c "
+#    from Perception.perception_pipeline import PerceptionPipeline
+#    import time; p=PerceptionPipeline()
+#    time.sleep(2); print(p.step())"
+#
+#  Stage 3 — World model alone (check Redis keys)
+#    docker compose up redis neo4j
+#    redis-cli keys '*'
+#
+#  Stage 4 — Planner mock (no arm movement)
+#    EXECUTOR_MOCK=1 python3 main.py
+#    # type: bring me the bottle
+#    # verify JSON plan printed — arm must NOT move
+#
+#  Stage 5 — ROS2 comms (Jetson to RPi)
+#    # On Jetson:
+#    ros2 topic pub /arm/cmd std_msgs/msg/String "data: 'arm_extend'"
+#    # On RPi:
+#    ros2 topic echo /arm/cmd
+#    # RPi must print the message — confirms domain ID matches
+#
+#  Stage 6 — Full end-to-end with real arm
+#    EXECUTOR_MOCK=0 docker compose up
+#    # Only run after all 5 stages pass
+# ================================================================
