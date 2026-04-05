@@ -1,0 +1,44 @@
+jetson orion nano jet pack 6.2 cuda 12.6
+ubuntu 22.04
+python 3.10
+# ── Core AI / Vision ──────────────────────────────────────────────────
+ultralytics>=8.0.0              # YOLOv8 object detection
+deep-sort-realtime>=1.3.2       # DeepSORT object tracking
+numpy>=1.24.0                   # Numerical computing
+opencv-python>=4.8.0            # Image processing (cv2)
+
+# ── LLM / Planning ────────────────────────────────────────────────────
+langchain-openai>=0.1.0         # Ollama + OpenAI LLM client
+langgraph>=0.1.0                # LangGraph state machine planner
+
+# ── Camera ────────────────────────────────────────────────────────────
+pyrealsense2>=2.54.0            # Intel RealSense D435 SDK
+
+# ── Memory / Storage ──────────────────────────────────────────────────
+redis>=5.0.0                    # Redis client for world model persistence
+
+# ── Deep Learning Runtime ─────────────────────────────────────────────
+# PyTorch — install separately for Jetson (JetPack-specific wheel):
+# pip install torch torchvision --index-url https://developer.download.nvidia.com/compute/redist/jp/v62
+# torch>=2.0.0                  # DO NOT pip install torch on Jetson — use JetPack wheel
+
+# ── Optional — improves performance but not required ──────────────────
+Pillow>=9.0.0                   # Image utilities (PIL)
+
+# ── Optional — semantic search (uses ~500MB RAM, disabled by default) ─
+# Enable with: ENABLE_EXPERIENCE_MEMORY=1 in .env
+# sentence-transformers>=2.2.0
+
+# ── Optional — vector search (disabled by default) ────────────────────
+# faiss-cpu>=1.7.0              # pip install faiss-cpu --break-system-packages
+
+# ── Optional — 3D point cloud fusion ──────────────────────────────────
+# open3d-cpu                    # ARM64 Jetson build required:
+                                # pip install open3d-cpu --break-system-packages
+
+# ── Optional — scene graph ────────────────────────────────────────────
+# neo4j>=5.0.0                  # Falls back to in-memory if unavailable
+
+# ── Optional — CLIP texture analysis ──────────────────────────────────
+# pip install git+https://github.com/openai/CLIP.git
+# NOTE: do NOT use 'pip install clip' — that is a different package
